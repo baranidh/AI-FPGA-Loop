@@ -1,0 +1,1081 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI-FPGA-Loop | Interactive Simulator</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg:     #0d1117;
+      --bg2:    #161b22;
+      --bg3:    #21262d;
+      --border: #30363d;
+      --text:   #c9d1d9;
+      --dim:    #8b949e;
+      --green:  #3fb950;
+      --cyan:   #79c0ff;
+      --yellow: #d29922;
+      --red:    #f85149;
+      --blue:   #58a6ff;
+      --purple: #bc8cff;
+      --orange: #f0883e;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Consolas', 'Cascadia Code', 'Menlo', monospace;
+      font-size: 12.5px;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      padding: 7px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    header h1 { font-size: 14px; font-weight: bold; color: var(--cyan); letter-spacing: .04em; }
+    .badge {
+      background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 4px; padding: 1px 7px; font-size: 10.5px; color: var(--dim);
+    }
+    #status-badge { border-color: var(--cyan); color: var(--cyan); }
+
+    /* ── Layout ── */
+    .main {
+      display: grid;
+      grid-template-columns: 234px 1fr;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ── */
+    .sidebar {
+      background: var(--bg2);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .sec-title {
+      color: var(--dim); font-size: 10px; text-transform: uppercase;
+      letter-spacing: .1em; border-bottom: 1px solid var(--border);
+      padding-bottom: 3px; margin-bottom: 5px;
+    }
+    label { color: var(--dim); font-size: 10.5px; display: block; margin-bottom: 2px; }
+    .row { display: flex; align-items: center; gap: 6px; }
+    input[type="range"] { flex: 1; accent-color: var(--cyan); cursor: pointer; }
+    .val { color: var(--cyan); font-size: 11.5px; min-width: 32px; text-align: right; }
+    input[type="number"], select {
+      background: var(--bg3); border: 1px solid var(--border);
+      color: var(--text); padding: 3px 7px; border-radius: 4px;
+      font-family: inherit; font-size: 11.5px; width: 100%;
+    }
+    .btn-row { display: flex; gap: 5px; }
+    button {
+      flex: 1; background: var(--bg3); border: 1px solid var(--border);
+      color: var(--text); padding: 5px 8px; cursor: pointer;
+      border-radius: 4px; font-family: inherit; font-size: 11.5px; transition: background .12s;
+    }
+    button:hover { background: #2d333b; }
+    button.go   { background: #162016; border-color: var(--green); color: var(--green); }
+    button.go:hover { background: #1f3a1f; }
+    button.stop { background: #211515; border-color: var(--red); color: var(--red); }
+    button.stop:hover { background: #3a1a1a; }
+    button.warn { background: #1e1a10; border-color: var(--yellow); color: var(--yellow); }
+    button.warn:hover { background: #302813; }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+
+    .cfg-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+    .cfg-table td { padding: 2px 3px; }
+    .cfg-table td:first-child { color: var(--dim); }
+    .cfg-table td:last-child  { color: var(--cyan); font-weight: bold; }
+
+    .mcard {
+      background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 4px; padding: 5px 7px;
+    }
+    .mcard .ml { font-size: 10px; color: var(--dim); }
+    .mcard .mv { font-size: 13px; font-weight: bold; color: var(--cyan); }
+    .mv.g { color: var(--green); } .mv.y { color: var(--yellow); } .mv.r { color: var(--red); }
+
+    .mg { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+
+    /* ── Content ── */
+    .content {
+      display: grid;
+      grid-template-rows: 210px 1fr 165px;
+      overflow: hidden;
+    }
+
+    /* ── Top row ── */
+    .top-row {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      border-bottom: 1px solid var(--border);
+      overflow: hidden;
+    }
+    .chart-wrap {
+      padding: 8px 10px;
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .chart-wrap canvas { flex: 1; min-height: 0; }
+
+    .info-panel {
+      padding: 8px 10px;
+      display: flex; flex-direction: column; gap: 7px; overflow-y: auto;
+    }
+    .prog-bar { background: var(--bg3); border-radius: 99px; height: 6px; overflow: hidden; }
+    .prog-fill {
+      height: 100%; background: linear-gradient(90deg, var(--blue), var(--cyan));
+      transition: width .3s; border-radius: 99px;
+    }
+    .best-box {
+      background: var(--bg3); border: 1px solid var(--green);
+      border-radius: 4px; padding: 7px 9px;
+    }
+    .best-r { font-size: 22px; font-weight: bold; color: var(--green); line-height: 1.1; }
+    .best-sub { font-size: 10.5px; color: var(--dim); margin-top: 3px; }
+    .best-met { font-size: 11px; color: var(--cyan); margin-top: 2px; }
+
+    /* ── Log ── */
+    .log-panel { display: flex; flex-direction: column; overflow: hidden; }
+    .log-hdr {
+      background: var(--bg2); border-bottom: 1px solid var(--border);
+      padding: 4px 10px; font-size: 10.5px; color: var(--dim);
+      display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+    }
+    .log-hdr button { flex: none; padding: 1px 8px; font-size: 10px; }
+    .log-scroll { overflow-y: auto; flex: 1; }
+    .log-tbl { width: 100%; border-collapse: collapse; font-size: 11px; }
+    .log-tbl th {
+      background: var(--bg2); color: var(--dim); padding: 3px 7px;
+      text-align: left; position: sticky; top: 0; border-bottom: 1px solid var(--border);
+      font-size: 10.5px; font-weight: normal; white-space: nowrap;
+    }
+    .log-tbl td { padding: 2.5px 7px; border-bottom: 1px solid rgba(48,54,61,.4); white-space: nowrap; }
+    .log-tbl tr:hover td { background: var(--bg3); }
+    .log-tbl tr.best-row td { background: rgba(63,185,80,.07); }
+    .me { color: var(--blue); } .mx { color: var(--green); }
+    .rg { color: var(--green); } .ry { color: var(--yellow); } .rr { color: var(--red); }
+
+    /* ── Verilog ── */
+    .verilog-panel {
+      border-top: 1px solid var(--border);
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .verilog-hdr {
+      background: var(--bg2); border-bottom: 1px solid var(--border);
+      padding: 4px 10px; font-size: 10.5px; color: var(--dim);
+      display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
+    }
+    .verilog-hdr span { color: var(--cyan); margin-left: 5px; }
+    .vbtn-grp { display: flex; gap: 4px; }
+    .vbtn-grp button { flex: none; padding: 1px 8px; font-size: 10px; }
+    .vcode {
+      flex: 1; overflow: auto; padding: 6px 10px;
+      font-size: 11px; line-height: 1.55; background: #090d12; color: var(--text);
+    }
+
+    /* Verilog syntax */
+    .vkw  { color: #ff7b72; }
+    .vmod { color: #ffa657; font-weight: bold; }
+    .vpar { color: var(--purple); }
+    .vnum { color: #a5d6ff; }
+    .vcmt { color: #6a737d; font-style: italic; }
+    .vdir { color: var(--cyan); }
+
+    /* ── Pulse animation ── */
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.3; } }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+           background: var(--green); animation: pulse 1s infinite; margin-right: 4px; }
+
+    /* scrollbar */
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ─────────────────────────────────────────────────────── -->
+<header>
+  <h1>⚡ AI-FPGA-Loop</h1>
+  <span class="badge">Interactive Simulator</span>
+  <span class="badge" id="status-badge">Ready</span>
+  <span style="margin-left:auto;font-size:10.5px;color:var(--dim)">
+    648 configs · Tabular Q-learning · Python-accurate fixed-point sim
+  </span>
+</header>
+
+<!-- ── Main ───────────────────────────────────────────────────────── -->
+<div class="main">
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+
+    <!-- Controls -->
+    <div>
+      <div class="sec-title">Controls</div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <div>
+          <label>Learning rate (α)</label>
+          <div class="row">
+            <input type="range" id="lr-r" min=".01" max=".5" step=".01" value=".1">
+            <span class="val" id="lr-v">0.10</span>
+          </div>
+        </div>
+        <div>
+          <label>Initial ε (epsilon)</label>
+          <div class="row">
+            <input type="range" id="eps-r" min=".05" max="1" step=".05" value=".9">
+            <span class="val" id="eps-v">0.90</span>
+          </div>
+        </div>
+        <div>
+          <label>ε decay / iteration</label>
+          <div class="row">
+            <input type="range" id="decay-r" min=".9" max=".999" step=".001" value=".97">
+            <span class="val" id="decay-v">0.970</span>
+          </div>
+        </div>
+        <div>
+          <label>Iterations to run</label>
+          <input type="number" id="iters-n" value="50" min="1" max="648">
+        </div>
+        <div>
+          <label>Speed</label>
+          <select id="speed-s">
+            <option value="0">⚡ Instant (batch)</option>
+            <option value="80">Fast (80 ms)</option>
+            <option value="250" selected>Normal (250 ms)</option>
+            <option value="600">Slow (600 ms)</option>
+            <option value="1200">Very slow (1.2 s)</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button id="run-btn" class="go" onclick="toggleRun()">▶ Run</button>
+      <button id="step-btn"           onclick="stepOne()">⏭ Step</button>
+    </div>
+    <div class="btn-row">
+      <button class="warn" onclick="resetAgent()">↺ Reset</button>
+      <button onclick="resetAgent(true)">↺ + reset ε</button>
+    </div>
+
+    <!-- Current config -->
+    <div>
+      <div class="sec-title">Current Config</div>
+      <table class="cfg-table" id="cfg-tbl">
+        <tr><td>bit_w</td>       <td id="c0">—</td></tr>
+        <tr><td>vec_len</td>     <td id="c1">—</td></tr>
+        <tr><td>pipe_stages</td> <td id="c2">—</td></tr>
+        <tr><td>act_type</td>    <td id="c3">—</td></tr>
+        <tr><td>accum_extra</td> <td id="c4">—</td></tr>
+        <tr><td>use_dsp</td>     <td id="c5">—</td></tr>
+      </table>
+    </div>
+
+    <!-- Last metrics -->
+    <div>
+      <div class="sec-title">Last Metrics</div>
+      <div class="mg">
+        <div class="mcard"><div class="ml">LUTs</div>   <div class="mv" id="m0">—</div></div>
+        <div class="mcard"><div class="ml">Freq</div>   <div class="mv" id="m1">—</div></div>
+        <div class="mcard"><div class="ml">Tput MOPS</div><div class="mv" id="m2">—</div></div>
+        <div class="mcard"><div class="ml">MAE</div>    <div class="mv" id="m3">—</div></div>
+        <div class="mcard" style="grid-column:1/-1">
+          <div class="ml">Reward</div>
+          <div class="mv" id="m4" style="font-size:18px">—</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Top 3 -->
+    <div>
+      <div class="sec-title">Top-3 by Q-value</div>
+      <div id="top3" style="font-size:11px;color:var(--dim)">Run to explore configs.</div>
+    </div>
+
+    <!-- AI insights -->
+    <div>
+      <div class="sec-title">AI Insights</div>
+      <div id="insights" style="font-size:11px;color:var(--dim)">Needs ≥ 8 iterations.</div>
+    </div>
+
+  </div><!-- /sidebar -->
+
+  <!-- Content -->
+  <div class="content">
+
+    <!-- Top row: chart + stats -->
+    <div class="top-row">
+      <div class="chart-wrap">
+        <div class="sec-title" style="margin-bottom:4px">Reward over Iterations</div>
+        <canvas id="chart"></canvas>
+      </div>
+
+      <div class="info-panel">
+        <div class="sec-title">Exploration</div>
+        <div style="font-size:11.5px">
+          <span id="exp-n" style="color:var(--cyan)">0</span>
+          <span style="color:var(--dim)"> / 648 configs explored</span>
+        </div>
+        <div class="prog-bar"><div class="prog-fill" id="exp-bar" style="width:0%"></div></div>
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--dim)">
+          <span>ε = <span id="eps-live" style="color:var(--cyan)">0.900</span></span>
+          <span>iter <span id="iter-n" style="color:var(--cyan)">0</span></span>
+        </div>
+
+        <div class="sec-title">Best Design Found</div>
+        <div class="best-box">
+          <div class="best-r" id="best-r">—</div>
+          <div class="best-sub" id="best-cfg">Run to find the best design</div>
+          <div class="best-met" id="best-met"></div>
+        </div>
+        <div style="font-size:11px;color:var(--dim)">
+          Trend: <span id="trend" style="color:var(--cyan)">—</span>
+        </div>
+      </div>
+    </div><!-- /top-row -->
+
+    <!-- Iteration log -->
+    <div class="log-panel">
+      <div class="log-hdr">
+        <span><span class="dot" id="run-dot" style="display:none"></span>
+          Iteration Log — <span id="log-n" style="color:var(--cyan)">0</span> iterations</span>
+        <span style="margin-left:auto"></span>
+        <button onclick="clearLog()">Clear</button>
+      </div>
+      <div class="log-scroll" id="log-scroll">
+        <table class="log-tbl">
+          <thead><tr>
+            <th>#</th><th>Method</th><th>bit_w</th><th>vec</th>
+            <th>pipe</th><th>act</th><th>dsp</th>
+            <th>LUTs</th><th>FFs</th><th>Freq</th>
+            <th>Tput MOPS</th><th>OPS/LUT</th><th>MAE</th><th>pass%</th><th>Reward</th>
+          </tr></thead>
+          <tbody id="log-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Verilog viewer -->
+    <div class="verilog-panel">
+      <div class="verilog-hdr">
+        <div>Verilog — <span id="v-label">no design yet</span></div>
+        <div class="vbtn-grp">
+          <button id="copy-btn" onclick="copyV()">Copy</button>
+          <button onclick="downloadV()">Download</button>
+        </div>
+      </div>
+      <div class="vcode" id="vcode">
+        <span class="vcmt">// Generated Verilog appears here after each iteration (new best or every 5 steps)</span>
+      </div>
+    </div>
+
+  </div><!-- /content -->
+</div><!-- /main -->
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// DESIGN SPACE
+// ═══════════════════════════════════════════════════════════════════════════
+
+const PARAM_SPACE = {
+  bit_w:       [4, 8, 16],
+  vec_len:     [2, 4, 8, 16],
+  pipe_stages: [1, 2, 3],
+  act_type:    [0, 1, 2],
+  accum_extra: [2, 4, 8],
+  use_dsp:     [0, 1],
+};
+const PNAMES = Object.keys(PARAM_SPACE);
+const ACT    = {0:'none', 1:'relu', 2:'clamp'};
+
+function allConfigs() {
+  const vals = PNAMES.map(k => PARAM_SPACE[k]);
+  const out = [];
+  function rec(i, cur) {
+    if (i === PNAMES.length) { out.push({...cur}); return; }
+    for (const v of vals[i]) { cur[PNAMES[i]] = v; rec(i+1, cur); }
+  }
+  rec(0, {});
+  return out;
+}
+
+const ALL = allConfigs();   // 648 configs
+const NTOT = ALL.length;    // 648
+
+function cfgKey(c) { return PNAMES.map(k => c[k]).join(','); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SEEDED PRNG (Mulberry32) — reproducible accuracy tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+function seededRng(seed) {
+  let s = seed >>> 0;
+  return function() {
+    s = (s + 0x6D2B79F5) >>> 0;
+    let t = Math.imul(s ^ (s >>> 15), s | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function randInt(rng, lo, hi) {
+  return lo + Math.floor(rng() * (hi - lo + 1));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIXED-POINT SIMULATOR  (bit-exact, matches Python/Verilog)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function sClamp(v, bits) {
+  const lo = -(1 << (bits-1)), hi = (1 << (bits-1)) - 1;
+  return v < lo ? lo : v > hi ? hi : Math.trunc(v);
+}
+
+function simDP(w, x, bias, cfg) {
+  const {bit_w, vec_len, act_type} = cfg;
+  const clamp_max = (1 << (bit_w-1)) - 1;
+  const clamp_min = -(1 << (bit_w-1));
+
+  let acc = bias;
+  for (let i = 0; i < vec_len; i++) acc += w[i] * x[i];
+  acc = Math.trunc(acc);
+
+  if (act_type === 0) {           // none — wrap (truncate low bits, re-sign)
+    let r = ((acc % (1 << bit_w)) + (1 << bit_w)) % (1 << bit_w);
+    if (r >= (1 << (bit_w-1))) r -= (1 << bit_w);
+    return r;
+  } else if (act_type === 1) {    // ReLU
+    return acc < 0 ? 0 : acc > clamp_max ? clamp_max : acc;
+  } else {                        // clamp
+    return sClamp(acc, bit_w);
+  }
+}
+
+function fp32Ref(w, x, bias, cfg) {
+  const {bit_w, vec_len, act_type} = cfg;
+  const hi = (1 << (bit_w-1)) - 1, lo = -(1 << (bit_w-1));
+  let acc = bias;
+  for (let i = 0; i < vec_len; i++) acc += w[i] * x[i];
+  if (act_type === 0) acc = acc > hi ? hi : acc < lo ? lo : acc;
+  else if (act_type === 1) acc = acc < 0 ? 0 : acc > hi ? hi : acc;
+  else acc = acc > hi ? hi : acc < lo ? lo : acc;
+  return acc;
+}
+
+function accuracyTest(cfg, nTests = 128) {
+  const {bit_w, vec_len} = cfg;
+  const hi = (1 << (bit_w-1)) - 1, lo = -(1 << (bit_w-1));
+  const sHi = Math.floor(hi/4), sLo = Math.ceil(lo/4);
+  const rng = seededRng(42);
+  const scale = (hi - lo) || 1;
+  let sumErr = 0, passes = 0;
+
+  for (let t = 0; t < nTests; t++) {
+    const w    = Array.from({length: vec_len}, () => randInt(rng, sLo, sHi));
+    const x    = Array.from({length: vec_len}, () => randInt(rng, sLo, sHi));
+    const bias = randInt(rng, sLo, sHi);
+    const ref  = fp32Ref(w, x, bias, cfg);
+    const out  = simDP(w, x, bias, cfg);
+    const err  = Math.abs(out - ref) / scale;
+    sumErr += err;
+    if (err < 0.10) passes++;
+  }
+  return { mae: sumErr / nTests, pass_rate: passes / nTests };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SYNTHESIS ESTIMATION  (calibrated to match Python models)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function synthEst(cfg) {
+  const {bit_w, vec_len, pipe_stages, act_type, accum_extra, use_dsp} = cfg;
+  const accum_w = bit_w*2 + accum_extra + Math.ceil(Math.log2(Math.max(vec_len,2)));
+
+  const mult_luts = use_dsp ? 3*vec_len : Math.floor(Math.pow(bit_w,1.4)*vec_len);
+  const adder_luts = Math.ceil(Math.ceil(Math.log2(Math.max(vec_len,2))) * accum_w / 4);
+  const act_luts  = [0, Math.floor(bit_w/2), bit_w][act_type];
+  const luts = mult_luts + adder_luts + act_luts + 8;
+  const ffs  = pipe_stages * bit_w + accum_w;
+  const dsps = use_dsp ? vec_len : 0;
+
+  const mult_d  = use_dsp ? 2.5 : 0.08 * Math.pow(bit_w, 1.5);
+  const adder_d = 0.05 * accum_w;
+  const act_d   = [0.0, 0.5, 0.8][act_type];
+  const cp      = (mult_d + adder_d + act_d) / pipe_stages + 0.5;
+  const frequency = Math.min(500, 1000 / Math.max(cp, 0.1));
+  const latency   = pipe_stages + 1;
+
+  return {luts, ffs, dsps, frequency, latency, synthesis_ok:true};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REWARD  (matches reward.py exactly)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const NORM = {tput:2000e6, acc:0.001, luts:500, freq:200, lat:3};
+const W    = {tput:.30, acc:.20, res:.25, freq:.15, lat:.10};
+
+function reward(m) {
+  if (!m.synthesis_ok) return -1.0;
+  if (m.pass_rate < 0.95) return -0.8;
+  const sT = Math.min(m.throughput / NORM.tput, 1);
+  const sA = Math.max(0, Math.min(1, 1 - m.mae / (2*NORM.acc)));
+  const sR = Math.max(0, Math.min(1, 1 - m.luts / (2*NORM.luts)));
+  const sF = Math.min(m.frequency / NORM.freq, 1);
+  const sL = Math.max(0, Math.min(1, 1 - m.latency / (2*NORM.lat)));
+  return W.tput*sT + W.acc*sA + W.res*sR + W.freq*sF + W.lat*sL;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Q-LEARNING AGENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+let A = newAgent();
+
+function newAgent() {
+  return {
+    lr: .1, gamma: .9, epsilon: .9, epsilonMin: .05, epsilonDecay: .97,
+    qTable: new Map(),   // cfgKey -> Q-value
+    history: [],         // [{config, metrics, reward}]
+    explored: new Set(), // cfgKeys explored
+    bestReward: -Infinity,
+    bestEntry: null,
+  };
+}
+
+function getQ(key)        { return A.qTable.get(key) ?? 0; }
+function bestQ()          { let b=-Infinity; for (const c of ALL) { const q=getQ(cfgKey(c)); if(q>b) b=q; } return b; }
+
+function selectConfig() {
+  if (Math.random() < A.epsilon) {
+    const pool = ALL.filter(c => !A.explored.has(cfgKey(c)));
+    const src  = pool.length ? pool : ALL;
+    return {cfg: src[Math.floor(Math.random()*src.length)], method:'explore'};
+  }
+  let best=ALL[0], bq=-Infinity;
+  for (const c of ALL) { const q=getQ(cfgKey(c)); if(q>bq){bq=q;best=c;} }
+  return {cfg: best, method:'exploit'};
+}
+
+function agentUpdate(cfg, r) {
+  const key = cfgKey(cfg);
+  const bq  = bestQ();
+  const td  = r + A.gamma * bq;
+  A.qTable.set(key, (1-A.lr)*getQ(key) + A.lr*td);
+  A.explored.add(key);
+  const entry = {config:{...cfg}, reward:r};
+  A.history.push(entry);
+  if (r > A.bestReward) { A.bestReward = r; A.bestEntry = {...entry}; }
+  A.epsilon = Math.max(A.epsilonMin, A.epsilon * A.epsilonDecay);
+}
+
+function topN(n) {
+  return [...A.explored]
+    .map(k => ({key:k, q:getQ(k)}))
+    .sort((a,b)=>b.q-a.q).slice(0,n)
+    .map(({key,q}) => {
+      const parts = key.split(',').map(Number);
+      const cfg = {}; PNAMES.forEach((p,i)=>cfg[p]=parts[i]);
+      return {cfg, q};
+    });
+}
+
+function insights() {
+  const h = A.history;
+  if (h.length < 8) return null;
+  const sorted = [...h].sort((a,b)=>b.reward-a.reward);
+  const topK = sorted.slice(0, Math.max(1, Math.floor(h.length/4)));
+  const botK = sorted.slice(-Math.max(1, Math.floor(h.length/4)));
+  const result = {};
+  for (const p of PNAMES) {
+    const tCnt={}, bCnt={};
+    for (const e of topK) tCnt[e.config[p]] = (tCnt[e.config[p]]||0)+1;
+    for (const e of botK) bCnt[e.config[p]] = (bCnt[e.config[p]]||0)+1;
+    const pref = PARAM_SPACE[p]
+      .map(v => ({v, diff: (tCnt[v]||0)/topK.length - (bCnt[v]||0)/botK.length}))
+      .filter(x=>x.diff>0.08).sort((a,b)=>b.diff-a.diff);
+    if (pref.length) result[p] = pref;
+  }
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ONE ITERATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+function runIter() {
+  const {cfg, method} = selectConfig();
+  const syn  = synthEst(cfg);
+  const acc  = accuracyTest(cfg);
+  const tput = syn.frequency * 1e6 * cfg.vec_len;
+  const m = {
+    synthesis_ok: true,
+    luts: syn.luts, ffs: syn.ffs, dsps: syn.dsps,
+    frequency: syn.frequency, latency: syn.latency,
+    throughput: tput, ops_per_lut: tput/Math.max(syn.luts,1),
+    mae: acc.mae, pass_rate: acc.pass_rate,
+  };
+  const prevBest = A.bestReward;
+  const r = reward(m);
+  agentUpdate(cfg, r);
+  return {cfg, method, metrics:m, reward:r, isBest: r > prevBest};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VERILOG GENERATOR  (matches verilog_gen.py)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function genVerilog(cfg, iter=0) {
+  const {bit_w, vec_len, pipe_stages, act_type, accum_extra, use_dsp} = cfg;
+  const accum_w  = bit_w*2 + accum_extra + Math.ceil(Math.log2(Math.max(vec_len,2)));
+  const act_str  = ACT[act_type];
+  const dsp_str  = use_dsp ? 'DSP' : 'LUT';
+  const clamp_max = (1<<(bit_w-1))-1;
+  const clamp_min = -(1<<(bit_w-1));
+
+  const psum_expr = Array.from({length:vec_len},(_,i)=>`psum[${i}]`).join(' + ');
+
+  let act_assign;
+  if (act_type === 0) {
+    act_assign = `act_in[${bit_w-1}:0]; // truncate`;
+  } else if (act_type === 1) {
+    act_assign =
+      `(act_in[${accum_w-1}]) ? ${bit_w}'d0 :  // negative -> 0\n` +
+      `        (act_in > ${accum_w}'sd${clamp_max}) ? ${bit_w}'sd${clamp_max} :\n` +
+      `        act_in[${bit_w-1}:0];`;
+  } else {
+    act_assign =
+      `(act_in > ${accum_w}'sd${clamp_max}) ? ${bit_w}'sd${clamp_max} :\n` +
+      `        (act_in < ${accum_w}'sd${clamp_min}) ? ${bit_w}'sd${clamp_min} :\n` +
+      `        act_in[${bit_w-1}:0];`;
+  }
+
+  let pipe_reg;
+  if (pipe_stages === 1) {
+    pipe_reg = `    reg signed [${bit_w-1}:0] y_reg;\n` +
+      `    always @(posedge clk or negedge rst_n) begin\n` +
+      `        if (!rst_n) y_reg <= ${bit_w}'d0;\n` +
+      `        else        y_reg <= act_out;\n    end`;
+  } else if (pipe_stages === 2) {
+    pipe_reg = `    reg signed [${bit_w-1}:0] y_p1, y_reg;\n` +
+      `    always @(posedge clk or negedge rst_n) begin\n` +
+      `        if (!rst_n) begin y_p1 <= ${bit_w}'d0; y_reg <= ${bit_w}'d0; end\n` +
+      `        else        begin y_p1 <= act_out;   y_reg <= y_p1;   end\n    end`;
+  } else {
+    pipe_reg = `    reg signed [${bit_w-1}:0] y_p1, y_p2, y_reg;\n` +
+      `    always @(posedge clk or negedge rst_n) begin\n` +
+      `        if (!rst_n) begin y_p1<=${bit_w}'d0; y_p2<=${bit_w}'d0; y_reg<=${bit_w}'d0; end\n` +
+      `        else        begin y_p1<=act_out; y_p2<=y_p1; y_reg<=y_p2; end\n    end`;
+  }
+
+  return (
+`// ============================================================
+// dot_product_unit.v  —  AI-FPGA-Loop  iter ${String(iter).padStart(4,'0')}
+// Config : bit_w=${bit_w} vec_len=${vec_len} pipe_stages=${pipe_stages}
+//          act=${act_str} accum_extra=${accum_extra} mult=${dsp_str}
+// ============================================================
+\`timescale 1ns/1ps
+
+module dot_product_unit #(
+    parameter BIT_W       = ${bit_w},
+    parameter VEC_LEN     = ${vec_len},
+    parameter PIPE_STAGES = ${pipe_stages},
+    parameter ACT_TYPE    = ${act_type},  // 0=none 1=relu 2=clamp
+    parameter ACCUM_EXTRA = ${accum_extra},
+    parameter USE_DSP     = ${use_dsp},
+    parameter ACCUM_W     = ${accum_w},
+    parameter PROD_W      = BIT_W * 2
+) (
+    input  wire                             clk,
+    input  wire                             rst_n,   // async active-low reset
+    input  wire signed [BIT_W*VEC_LEN-1:0] w_flat,  // weight vector (packed)
+    input  wire signed [BIT_W*VEC_LEN-1:0] x_flat,  // input  vector (packed)
+    input  wire signed [BIT_W-1:0]         bias,
+    output reg  signed [BIT_W-1:0]         y
+);
+
+    // ── Unpack flat ports into arrays ─────────────────────────
+    wire signed [BIT_W-1:0] w [0:VEC_LEN-1];
+    wire signed [BIT_W-1:0] x [0:VEC_LEN-1];
+    genvar k;
+    generate
+        for (k = 0; k < VEC_LEN; k = k + 1) begin : unpack
+            assign w[k] = w_flat[BIT_W*(k+1)-1 : BIT_W*k];
+            assign x[k] = x_flat[BIT_W*(k+1)-1 : BIT_W*k];
+        end
+    endgenerate
+
+    // ── Multiplier array (${dsp_str}) ──────────────────────────
+    wire signed [PROD_W-1:0] products [0:VEC_LEN-1];
+    genvar i;
+    generate
+        for (i = 0; i < VEC_LEN; i = i + 1) begin : mult_array
+            (* use_dsp = "${use_dsp ? 'yes' : 'no'}" *)
+            assign products[i] = $signed(w[i]) * $signed(x[i]);
+        end
+    endgenerate
+
+    // ── Sign-extended partial sums ────────────────────────────
+    wire signed [ACCUM_W-1:0] psum [0:VEC_LEN-1];
+    genvar j;
+    generate
+        for (j = 0; j < VEC_LEN; j = j + 1) begin : psum_init
+            assign psum[j] = {{(ACCUM_W-PROD_W){products[j][PROD_W-1]}}, products[j]};
+        end
+    endgenerate
+
+    // ── Adder tree ────────────────────────────────────────────
+    wire signed [ACCUM_W-1:0] tree_sum;
+    assign tree_sum = ${psum_expr};
+
+    wire signed [ACCUM_W-1:0] biased_sum;
+    assign biased_sum = tree_sum +
+        $signed({{(ACCUM_W-BIT_W){bias[BIT_W-1]}}, bias});
+
+    // ── Activation: ${act_str} ────────────────────────────────
+    wire signed [ACCUM_W-1:0] act_in;
+    wire signed [BIT_W-1:0]   act_out;
+    assign act_in  = biased_sum;
+    assign act_out =
+        ${act_assign}
+
+    // ── Pipeline registers (depth=${pipe_stages}, async rst_n) ─
+${pipe_reg}
+
+    always @(*) y = y_reg;
+
+endmodule
+// end of dot_product_unit`
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VERILOG SYNTAX HIGHLIGHTER
+// ═══════════════════════════════════════════════════════════════════════════
+
+const KW = ['module','endmodule','parameter','localparam','input','output',
+            'wire','reg','assign','always','if','else','begin','end',
+            'generate','endgenerate','genvar','for','signed','posedge','negedge',
+            'timescale'];
+
+function hiVerilog(code) {
+  let s = code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // comments (must go first)
+  s = s.replace(/(\/\/[^\n]*)/g, '<span class="vcmt">$1</span>');
+  // radix numbers
+  s = s.replace(/\b(\d+)'([bBdDhH][0-9a-fA-FxXzZ_]+)/g,
+                '<span class="vnum">$1\'$2</span>');
+  // plain numbers (not inside spans)
+  s = s.replace(/(?<![a-zA-Z_"'])(\b\d+\b)(?![a-zA-Z_"'])/g,
+                '<span class="vnum">$1</span>');
+  // module name
+  s = s.replace(/\b(dot_product_unit)\b/g, '<span class="vmod">$1</span>');
+  // keywords
+  for (const kw of KW)
+    s = s.replace(new RegExp(`\\b(${kw})\\b`,'g'), '<span class="vkw">$1</span>');
+  // UPPER_CASE params/ports
+  s = s.replace(/\b([A-Z][A-Z_0-9]{2,})\b/g, '<span class="vpar">$1</span>');
+  // port direction words already handled by keywords
+  return s;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CHART
+// ═══════════════════════════════════════════════════════════════════════════
+
+let chart;
+function initChart() {
+  const ctx = document.getElementById('chart').getContext('2d');
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label:'Reward', data:[], borderColor:'#3fb950',
+          backgroundColor:'rgba(63,185,80,.07)', borderWidth:1.5,
+          pointRadius:2, pointHoverRadius:5, fill:true, tension:.25 },
+        { label:'Best so far', data:[], borderColor:'#79c0ff',
+          borderWidth:1, pointRadius:0, fill:false,
+          borderDash:[5,5], tension:0 },
+      ]
+    },
+    options: {
+      responsive:true, maintainAspectRatio:false, animation:false,
+      plugins:{
+        legend:{ labels:{ color:'#8b949e', font:{family:'Consolas',size:10} } }
+      },
+      scales:{
+        x:{ grid:{color:'rgba(48,54,61,.45)'},
+            ticks:{color:'#8b949e', font:{size:9}, maxTicksLimit:12} },
+        y:{ min:-1.05, max:1.05,
+            grid:{color:'rgba(48,54,61,.45)'},
+            ticks:{color:'#8b949e', font:{size:9}} },
+      }
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI UPDATE
+// ═══════════════════════════════════════════════════════════════════════════
+
+let iterDone = 0;
+let curVerilog = '';
+
+function ui({cfg, method, metrics:m, reward:r, isBest}) {
+  iterDone++;
+
+  // Config
+  const cv = [cfg.bit_w, cfg.vec_len, cfg.pipe_stages, ACT[cfg.act_type],
+              cfg.accum_extra, cfg.use_dsp ? 'DSP' : 'LUT'];
+  cv.forEach((v,i) => el('c'+i).textContent = v);
+
+  // Metrics
+  el('m0').textContent = m.luts;
+  el('m1').textContent = m.frequency.toFixed(0) + ' MHz';
+  el('m2').textContent = (m.throughput/1e6).toFixed(0);
+  el('m3').textContent = m.mae.toFixed(4);
+  const re = el('m4');
+  re.textContent = fmt(r);
+  re.className = 'mv ' + rClass(r);
+
+  // Chart (cap at 300 pts for performance)
+  if (chart.data.labels.length >= 300) {
+    chart.data.labels.shift();
+    chart.data.datasets[0].data.shift();
+    chart.data.datasets[1].data.shift();
+  }
+  chart.data.labels.push(iterDone);
+  chart.data.datasets[0].data.push(r);
+  chart.data.datasets[1].data.push(A.bestReward === -Infinity ? null : A.bestReward);
+  chart.update('none');
+
+  // Exploration
+  const exp = A.explored.size;
+  el('exp-n').textContent  = exp;
+  el('exp-bar').style.width = (exp/NTOT*100).toFixed(1)+'%';
+  el('eps-live').textContent = A.epsilon.toFixed(3);
+  el('iter-n').textContent   = iterDone;
+
+  // Best design
+  if (A.bestEntry) {
+    const bc = A.bestEntry.config;
+    const bm = A.bestEntry.metrics || m;  // fallback
+    el('best-r').textContent   = fmt(A.bestReward);
+    el('best-cfg').textContent = `bit_w=${bc.bit_w} vec=${bc.vec_len} pipe=${bc.pipe_stages} act=${ACT[bc.act_type]} dsp=${bc.use_dsp}`;
+    if (A.bestEntry.metrics) {
+      const bmet = A.bestEntry.metrics;
+      el('best-met').textContent =
+        `LUTs=${bmet.luts} · ${bmet.frequency.toFixed(0)}MHz · ${(bmet.throughput/1e6).toFixed(0)}MOPS`;
+    }
+  }
+
+  // Trend
+  const h = A.history;
+  if (h.length >= 4) {
+    const n1 = Math.min(10, h.length), n2 = Math.min(10, h.length);
+    const f  = h.slice(0,n1).reduce((a,e)=>a+e.reward,0)/n1;
+    const l  = h.slice(-n2).reduce((a,e)=>a+e.reward,0)/n2;
+    const ar = l > f ? '↑' : '↓';
+    const col = l > f ? 'var(--green)' : 'var(--red)';
+    el('trend').innerHTML = `<span style="color:${col}">${ar}</span> ${f.toFixed(3)} → ${l.toFixed(3)}`;
+  }
+
+  // Top-3
+  const t3 = topN(3);
+  el('top3').innerHTML = t3.length ? t3.map((d,i)=>{
+    const c=d.cfg;
+    return `<div style="margin:2px 0">
+      <span style="color:var(--dim)">${i+1}.</span>
+      <span style="color:var(--cyan)">Q=${d.q.toFixed(3)}</span>
+      &nbsp;b=${c.bit_w} v=${c.vec_len} p=${c.pipe_stages} ${ACT[c.act_type]} ${c.use_dsp?'DSP':'LUT'}
+    </div>`;
+  }).join('') : 'Not yet explored.';
+
+  // AI insights
+  const ins = insights();
+  if (ins) {
+    const lines = Object.entries(ins).map(([p, pref]) => {
+      const vals = pref.slice(0,3).map(({v,diff})=>`<span style="color:var(--green)">${v}(+${(diff*100).toFixed(0)}%)</span>`).join(' ');
+      return `<div style="margin:1px 0"><span style="color:var(--dim)">${p}:</span> ${vals}</div>`;
+    });
+    el('insights').innerHTML = lines.join('');
+  }
+
+  // Log row (prepend = newest on top)
+  const tbody = el('log-body');
+  const row   = document.createElement('tr');
+  if (isBest) row.className = 'best-row';
+  row.innerHTML = `
+    <td>${String(iterDone).padStart(3,'0')}${isBest?' ★':''}</td>
+    <td class="${method==='explore'?'me':'mx'}">${method}</td>
+    <td>${cfg.bit_w}</td><td>${cfg.vec_len}</td><td>${cfg.pipe_stages}</td>
+    <td>${ACT[cfg.act_type]}</td><td>${cfg.use_dsp?'DSP':'LUT'}</td>
+    <td>${m.luts}</td><td>${m.ffs}</td><td>${m.frequency.toFixed(0)}</td>
+    <td>${(m.throughput/1e6).toFixed(0)}</td><td>${(m.ops_per_lut/1e3).toFixed(0)}k</td>
+    <td>${m.mae.toFixed(4)}</td><td>${(m.pass_rate*100).toFixed(0)}%</td>
+    <td class="${rClass(r)}">${fmt(r)}</td>`;
+  tbody.insertBefore(row, tbody.firstChild);
+  el('log-n').textContent = iterDone;
+
+  // Verilog (new best or every 5 iters)
+  if (isBest || iterDone % 5 === 0) {
+    const vcode = genVerilog(cfg, iterDone);
+    curVerilog  = vcode;
+    el('vcode').innerHTML = hiVerilog(vcode);
+    el('v-label').textContent =
+      `bit_w=${cfg.bit_w} vec=${cfg.vec_len} pipe=${cfg.pipe_stages} act=${ACT[cfg.act_type]} dsp=${cfg.use_dsp?'DSP':'LUT'}`;
+    // store metrics for best-met fallback
+    if (isBest) A.bestEntry.metrics = m;
+  }
+
+  el('status-badge').textContent = `iter ${iterDone} · ε=${A.epsilon.toFixed(2)}`;
+}
+
+function el(id) { return document.getElementById(id); }
+function fmt(r) { return (r>=0?'+':'')+r.toFixed(4); }
+function rClass(r) { return r>0.5?'rg':r>0?'ry':'rr'; }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RUN CONTROL
+// ═══════════════════════════════════════════════════════════════════════════
+
+let running = false, runTimer = null, runTarget = 0;
+
+function toggleRun() {
+  if (running) { stopRun(); } else { startRun(); }
+}
+
+function startRun() {
+  A.lr           = +el('lr-r').value;
+  A.epsilonDecay = +el('decay-r').value;
+  runTarget = iterDone + (+el('iters-n').value || 50);
+  const speed = +el('speed-s').value;
+  running = true;
+  el('run-btn').textContent = '⏸ Pause';
+  el('run-btn').className   = 'stop';
+  el('step-btn').disabled   = true;
+  el('run-dot').style.display = 'inline-block';
+
+  if (speed === 0) {
+    while (running && iterDone < runTarget) { ui(runIter()); }
+    stopRun();
+    return;
+  }
+  (function tick() {
+    if (!running || iterDone >= runTarget) { stopRun(); return; }
+    ui(runIter());
+    runTimer = setTimeout(tick, speed);
+  })();
+}
+
+function stopRun() {
+  running = false;
+  if (runTimer) { clearTimeout(runTimer); runTimer = null; }
+  el('run-btn').textContent = '▶ Run';
+  el('run-btn').className   = 'go';
+  el('step-btn').disabled   = false;
+  el('run-dot').style.display = 'none';
+  el('status-badge').textContent = iterDone ? `Done (${iterDone} iters)` : 'Ready';
+}
+
+function stepOne() {
+  if (running) return;
+  A.lr           = +el('lr-r').value;
+  A.epsilonDecay = +el('decay-r').value;
+  ui(runIter());
+}
+
+function resetAgent(resetEps=false) {
+  stopRun();
+  const eps  = resetEps ? +el('eps-r').value : A.epsilon;
+  A = newAgent();
+  A.lr           = +el('lr-r').value;
+  A.epsilon      = eps;
+  A.epsilonDecay = +el('decay-r').value;
+  iterDone   = 0;
+  curVerilog = '';
+
+  // Reset chart
+  chart.data.labels = [];
+  chart.data.datasets[0].data = [];
+  chart.data.datasets[1].data = [];
+  chart.update();
+
+  // Reset metrics cards
+  ['m0','m1','m2','m3','m4'].forEach(id=>{
+    el(id).textContent='—'; el(id).className='mv';
+  });
+  // Reset config cells
+  ['c0','c1','c2','c3','c4','c5'].forEach(id => el(id).textContent='—');
+  // Reset stats
+  el('exp-n').textContent='0'; el('exp-bar').style.width='0%';
+  el('eps-live').textContent=A.epsilon.toFixed(3);
+  el('iter-n').textContent='0';
+  el('best-r').textContent='—';
+  el('best-cfg').textContent='Run to find the best design';
+  el('best-met').textContent='';
+  el('trend').textContent='—';
+  el('top3').textContent='Run to explore configs.';
+  el('insights').textContent='Needs ≥ 8 iterations.';
+  el('log-body').innerHTML=''; el('log-n').textContent='0';
+  el('vcode').innerHTML='<span class="vcmt">// Verilog will appear here</span>';
+  el('v-label').textContent='no design yet';
+  el('status-badge').textContent='Ready';
+}
+
+function clearLog() {
+  el('log-body').innerHTML='';
+  el('log-n').textContent='0';
+}
+
+function copyV() {
+  if (!curVerilog) return;
+  navigator.clipboard.writeText(curVerilog).then(()=>{
+    el('copy-btn').textContent='Copied!';
+    setTimeout(()=>el('copy-btn').textContent='Copy', 1500);
+  });
+}
+
+function downloadV() {
+  if (!curVerilog) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([curVerilog], {type:'text/plain'}));
+  a.download = 'dot_product_unit.v';
+  a.click();
+}
+
+// ── Range → display ───────────────────────────────────────────────────────
+function bindRange(id, dispId, fmt) {
+  const r=el(id), d=el(dispId);
+  r.addEventListener('input', ()=>d.textContent=fmt(+r.value));
+}
+bindRange('lr-r',    'lr-v',    v=>v.toFixed(2));
+bindRange('eps-r',   'eps-v',   v=>v.toFixed(2));
+bindRange('decay-r', 'decay-v', v=>v.toFixed(3));
+
+// ── Init ──────────────────────────────────────────────────────────────────
+initChart();
+</script>
+</body>
+</html>
