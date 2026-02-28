@@ -13,23 +13,27 @@
 ## What It Does
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        AI-FPGA-LOOP                                 │
-│                                                                     │
-│  ┌───────────┐     ┌──────────────┐     ┌──────────────────────┐   │
-│  │  Q-Agent  │────▶│ Verilog Gen  │────▶│  Synthesizer /       │   │
-│  │           │     │ dot_product  │     │  Python Simulator    │   │
-│  │ ε-greedy  │     │ _unit.v      │     │                      │   │
-│  │ Q-table   │     │              │     │  • LUT / FF counts   │   │
-│  └─────┲─────┘     └──────────────┘     │  • Clock frequency   │   │
-│        ┃                                │  • Throughput        │   │
-│        ┃           ┌──────────────┐     │  • Accuracy (MAE)    │   │
-│        ┗━━━━━━━━━━━│ Reward Fn    │◀────└──────────────────────┘   │
-│                    │ (weighted)   │                                 │
-│                    └──────┲───────┘                                 │
-│                           ┃  human review every N iters            │
-│                           ┗━━▶ [C]ontinue [S]top [R]eset           │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          AI-FPGA-LOOP                                    │
+│                                                                          │
+│  ┌───────────┐    ┌─────────────┐    ┌──────────────────────────────┐   │
+│  │  Q-Agent  │───▶│ Verilog Gen │───▶│  Synthesizer / Simulator     │   │
+│  │ ε-greedy  │    │ dot_product │    │  • LUT / FF counts           │   │
+│  │ Q-table   │    │ _unit.v     │    │  • Clock frequency           │   │
+│  └─────┲─────┘    └─────────────┘    │  • Throughput                │   │
+│        ┃                             └──────────────┬───────────────┘   │
+│        ┃                                            │ HW config         │
+│        ┃          ┌──────────────────────────────┐  │                   │
+│        ┃          │  TinyMLP Inference (8→16→4)  │◀─┘                   │
+│        ┃          │  • Quantized FPGA inference  │                      │
+│        ┃          │  • FP32 baseline accuracy    │                      │
+│        ┃          │  • QAT fine-tuning (×10 iters│                      │
+│        ┃          └──────────────┬───────────────┘                      │
+│        ┃                         │ inference_acc / fp32_acc             │
+│        ┃          ┌──────────────▼───────────────┐                      │
+│        ┗━━━━━━━━━━│  Reward Fn (40% infer. acc)  │                      │
+│                   └──────────────────────────────┘                      │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 The **FPGA hardware being designed** is a parameterised dot-product unit:
@@ -38,9 +42,15 @@ The **FPGA hardware being designed** is a parameterised dot-product unit:
 y = activation( Σ w_i · x_i + bias )
 ```
 
-This is the fundamental compute primitive inside every neural network layer
-— dense layers, convolutions, and attention heads all reduce to this
-operation.
+This is the fundamental compute primitive inside every neural network layer.
+The twist: a real **TinyMLP (8→16→4)** runs inference *on that hardware*
+using its quantization and activation settings. How much FP32 accuracy the
+quantized FPGA hardware retains is the primary closed-loop signal.
+
+Every 10 iterations, **QAT (quantization-aware training)** fine-tunes the
+model for the current best hardware config — so the model learns to tolerate
+the hardware's constraints, which raises the reward for good configs and
+reinforces the agent's preference for them.
 
 ---
 
@@ -51,7 +61,7 @@ operation.
 | `bit_w`        | 4, 8, 16         | precision vs. resource usage     |
 | `vec_len`      | 2, 4, 8, 16      | parallelism vs. area             |
 | `pipe_stages`  | 1, 2, 3          | throughput vs. latency           |
-| `act_type`     | none, relu, clamp| accuracy vs. simplicity          |
+| `act_type`     | wrap, relu, clamp| accuracy vs. simplicity          |
 | `accum_extra`  | 2, 4, 8          | overflow safety vs. width        |
 | `use_dsp`      | LUT-mult, DSP    | efficiency vs. portability       |
 
@@ -59,17 +69,37 @@ operation.
 
 ## Performance Metrics & Reward
 
-| Metric          | Direction | Weight |
-|-----------------|-----------|--------|
-| Throughput (OPS)| ↑ higher  | 30%    |
-| Accuracy (MAE)  | ↓ lower   | 20%    |
-| LUT efficiency  | ↓ fewer   | 25%    |
-| Clock frequency | ↑ higher  | 15%    |
-| Latency (cycles)| ↓ lower   | 10%    |
+The reward function mirrors `reward.py` exactly.
 
-- Synthesis failure → reward **−1.0**
-- Pass rate < 95% → reward **−0.8**
-- Otherwise → weighted sum ∈ [0, 1]
+**Hard gates** (checked before weighted scoring):
+
+| Condition                         | Reward |
+|-----------------------------------|--------|
+| Synthesis failure                 | −1.0   |
+| HW pass rate < 95%                | −0.8   |
+
+**Weighted score** (applied only when both gates pass):
+
+| Metric                              | Direction | Weight | Normalisation target |
+|-------------------------------------|-----------|--------|----------------------|
+| Inference acc (FPGA ÷ FP32)         | ↑ higher  | **40%**| ratio = 1.0          |
+| Throughput (OPS/s)                  | ↑ higher  | 25%    | 2 GOPS               |
+| LUT resource usage                  | ↓ fewer   | 20%    | 500 LUTs             |
+| Clock frequency                     | ↑ higher  | 10%    | 200 MHz              |
+| Pipeline latency (cycles)           | ↓ lower   | 5%     | 3 cycles             |
+
+The **inference accuracy score** is the fraction of FP32 accuracy retained on
+the quantized FPGA hardware:
+
+```
+s_inf = fpga_accuracy / fp32_accuracy     # clamped to [0, 1]
+
+reward = 0.40·s_inf + 0.25·s_tput + 0.20·s_res + 0.10·s_freq + 0.05·s_lat
+```
+
+- `bit_w=4 + act=wrap` → heavy quantization → accuracy collapses → low reward
+- `bit_w=8 + act=relu` → mild quantization → accuracy preserved → high reward
+- `bit_w=16 + act=relu` → near-lossless → best accuracy → highest reward
 
 ---
 
@@ -165,10 +195,13 @@ logs/
 ai-fpga-loop/
 ├── main_loop.py       # Main orchestrator & CLI
 ├── design_agent.py    # Tabular Q-learning agent
+├── neural_net.py      # TinyMLP (8→16→4): FP32 training, FPGA inference, QAT
+├── dataset.py         # Synthetic 4-class/8-feature classification benchmark
 ├── verilog_gen.py     # Synthesizable Verilog generator
-├── simulator.py       # Pure-Python fixed-point simulator
+├── simulator.py       # Pure-Python fixed-point dot-product simulator
 ├── synthesizer.py     # Yosys + iverilog wrappers
-├── reward.py          # Weighted reward function
+├── reward.py          # Reward function (40% inference acc + 60% HW metrics)
+├── index.html         # Browser-based interactive simulator (self-contained)
 ├── upload_to_github.sh
 ├── build/             # Generated Verilog files
 ├── logs/              # JSON run logs
@@ -196,7 +229,7 @@ The agent uses **tabular Q-learning** over the 648-configuration design space:
 - `genvar`-based parallel multiplier array
 - Signed adder tree with proper sign extension
 - Pipeline registers with async active-low reset
-- Combinational activation (none / ReLU / clamp)
+- Combinational activation (wrap / ReLU / clamp)
 - DSP or LUT inference hint via synthesis attributes
 
 ---
