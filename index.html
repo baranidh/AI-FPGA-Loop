@@ -217,7 +217,7 @@
   <span class="badge">Interactive Simulator</span>
   <span class="badge" id="status-badge">Ready</span>
   <span style="margin-left:auto;font-size:10.5px;color:var(--dim)">
-    648 configs · Tabular Q-learning · Python-accurate fixed-point sim
+    648 configs · Tabular Q-learning · TinyMLP 8→16→4 · NN inference reward
   </span>
 </header>
 
@@ -298,7 +298,11 @@
         <div class="mcard"><div class="ml">LUTs</div>   <div class="mv" id="m0">—</div></div>
         <div class="mcard"><div class="ml">Freq</div>   <div class="mv" id="m1">—</div></div>
         <div class="mcard"><div class="ml">Tput MOPS</div><div class="mv" id="m2">—</div></div>
-        <div class="mcard"><div class="ml">MAE</div>    <div class="mv" id="m3">—</div></div>
+        <div class="mcard"><div class="ml">FPGA Acc</div><div class="mv" id="m3">—</div></div>
+        <div class="mcard" style="grid-column:1/-1">
+          <div class="ml">FP32 Acc <span id="fp32-acc" style="color:var(--cyan);margin-left:4px">—</span>
+          &nbsp;·&nbsp; Ratio <span id="acc-ratio" style="color:var(--purple)">—</span></div>
+        </div>
         <div class="mcard" style="grid-column:1/-1">
           <div class="ml">Reward</div>
           <div class="mv" id="m4" style="font-size:18px">—</div>
@@ -367,8 +371,8 @@
           <thead><tr>
             <th>#</th><th>Method</th><th>bit_w</th><th>vec</th>
             <th>pipe</th><th>act</th><th>dsp</th>
-            <th>LUTs</th><th>FFs</th><th>Freq</th>
-            <th>Tput MOPS</th><th>OPS/LUT</th><th>MAE</th><th>pass%</th><th>Reward</th>
+            <th>LUTs</th><th>Freq</th><th>Tput MOPS</th>
+            <th>FP32%</th><th>FPGA%</th><th>Ratio</th><th>Reward</th>
           </tr></thead>
           <tbody id="log-body"></tbody>
         </table>
@@ -406,7 +410,7 @@ const PARAM_SPACE = {
   use_dsp:     [0, 1],
 };
 const PNAMES = Object.keys(PARAM_SPACE);
-const ACT    = {0:'none', 1:'relu', 2:'clamp'};
+const ACT    = {0:'wrap', 1:'relu', 2:'clamp'};
 
 function allConfigs() {
   const vals = PNAMES.map(k => PARAM_SPACE[k]);
@@ -425,7 +429,7 @@ const NTOT = ALL.length;    // 648
 function cfgKey(c) { return PNAMES.map(k => c[k]).join(','); }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SEEDED PRNG (Mulberry32) — reproducible accuracy tests
+// SEEDED PRNG (Mulberry32) + Box-Muller Gaussian
 // ═══════════════════════════════════════════════════════════════════════════
 
 function seededRng(seed) {
@@ -438,69 +442,194 @@ function seededRng(seed) {
   };
 }
 
-function randInt(rng, lo, hi) {
-  return lo + Math.floor(rng() * (hi - lo + 1));
+function gaussRng(rng) {
+  let u; do { u = rng(); } while (u === 0);
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// FIXED-POINT SIMULATOR  (bit-exact, matches Python/Verilog)
+// SYNTHETIC DATASET  (4 classes · 8 features · Gaussian clusters)
+// mirrors dataset.py — separable enough for 8-bit, tough for 4-bit
 // ═══════════════════════════════════════════════════════════════════════════
 
-function sClamp(v, bits) {
-  const lo = -(1 << (bits-1)), hi = (1 << (bits-1)) - 1;
-  return v < lo ? lo : v > hi ? hi : Math.trunc(v);
+function makeDataset(nPerClass, seed) {
+  const rng = seededRng(seed), g = () => gaussRng(rng);
+  const NC = 4, NF = 8;
+  const ctrs = Array.from({length:NC}, () => Array.from({length:NF}, () => g() * 3.0));
+  const X = [], y = [];
+  for (let c = 0; c < NC; c++) {
+    for (let i = 0; i < nPerClass; i++) { X.push(ctrs[c].map(mu => mu + g() * 0.9)); y.push(c); }
+  }
+  const rng2 = seededRng(seed + 7);
+  const idx  = Array.from({length:X.length}, (_,i)=>i).sort(() => rng2() - 0.5);
+  const Xs = idx.map(i=>X[i]), ys = idx.map(i=>y[i]);
+  const n = Xs.length;
+  const mu = Array(NF).fill(0), sg = Array(NF).fill(0);
+  Xs.forEach(x => x.forEach((v,f) => mu[f] += v/n));
+  Xs.forEach(x => x.forEach((v,f) => sg[f] += (v-mu[f])**2/n));
+  sg.forEach((_,f) => sg[f] = Math.sqrt(sg[f]) || 1);
+  return {X: Xs.map(x => x.map((v,f) => (v-mu[f])/sg[f])), y: ys};
 }
 
-function simDP(w, x, bias, cfg) {
+// ═══════════════════════════════════════════════════════════════════════════
+// QUANTIZE HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function quantize2d(W, bw) {
+  const cMax = (1<<(bw-1))-1, cMin = -(1<<(bw-1));
+  let abs = 0; for (const r of W) for (const v of r) if (Math.abs(v)>abs) abs=Math.abs(v);
+  const sc = abs > 0 ? abs/cMax : 1;
+  return W.map(r => r.map(v => Math.max(cMin, Math.min(cMax, Math.round(v/sc)))));
+}
+function quantize1d(b, bw) {
+  const cMax = (1<<(bw-1))-1, cMin = -(1<<(bw-1));
+  let abs = 0; for (const v of b) if (Math.abs(v)>abs) abs=Math.abs(v);
+  const sc = abs > 0 ? abs/cMax : 1;
+  return b.map(v => Math.max(cMin, Math.min(cMax, Math.round(v/sc))));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FPGA LAYER  (mirrors neural_net.py → fpga_layer)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function fpgaLayer(Xq, Wq, bq, cfg, applyAct) {
   const {bit_w, vec_len, act_type} = cfg;
-  const clamp_max = (1 << (bit_w-1)) - 1;
-  const clamp_min = -(1 << (bit_w-1));
-
-  let acc = bias;
-  for (let i = 0; i < vec_len; i++) acc += w[i] * x[i];
-  acc = Math.trunc(acc);
-
-  if (act_type === 0) {           // none — wrap (truncate low bits, re-sign)
-    let r = ((acc % (1 << bit_w)) + (1 << bit_w)) % (1 << bit_w);
-    if (r >= (1 << (bit_w-1))) r -= (1 << bit_w);
+  const cMax = (1<<(bit_w-1))-1, cMin = -(1<<(bit_w-1));
+  const inDim = Wq.length, outDim = Wq[0].length;
+  return Xq.map(xRow => Array.from({length:outDim}, (_,j) => {
+    let acc = bq[j];
+    for (let st=0; st<inDim; st+=vec_len) {
+      const en = Math.min(st+vec_len, inDim);
+      for (let k=st; k<en; k++) acc += xRow[k] * Wq[k][j];
+    }
+    if (!applyAct) return acc;
+    if (act_type===1) return acc<0 ? 0 : acc>cMax ? cMax : acc;      // ReLU
+    if (act_type===2) return acc<cMin ? cMin : acc>cMax ? cMax : acc; // clamp
+    let r = ((acc%(1<<bit_w))+(1<<bit_w))%(1<<bit_w);                 // wrap
+    if (r>=(1<<(bit_w-1))) r -= (1<<bit_w);
     return r;
-  } else if (act_type === 1) {    // ReLU
-    return acc < 0 ? 0 : acc > clamp_max ? clamp_max : acc;
-  } else {                        // clamp
-    return sClamp(acc, bit_w);
+  }));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TINY MLP  8 → 16 (ReLU) → 4  (mirrors neural_net.py TinyMLP)
+// ═══════════════════════════════════════════════════════════════════════════
+
+class TinyMLP {
+  constructor(seed) {
+    const rng = seededRng(seed+1000), g = () => gaussRng(rng);
+    this.W1 = Array.from({length:8},  () => Array.from({length:16}, () => g()*Math.sqrt(2/8)));
+    this.b1 = Array(16).fill(0);
+    this.W2 = Array.from({length:16}, () => Array.from({length:4},  () => g()*Math.sqrt(2/16)));
+    this.b2 = Array(4).fill(0);
+  }
+
+  _fwd(X) {
+    const H = X.map(x => Array.from({length:16}, (_,j) => {
+      let a=this.b1[j]; for(let i=0;i<8;i++) a+=x[i]*this.W1[i][j]; return a<0?0:a;
+    }));
+    return {H, logits: H.map(h => Array.from({length:4}, (_,j) => {
+      let a=this.b2[j]; for(let i=0;i<16;i++) a+=h[i]*this.W2[i][j]; return a;
+    }))};
+  }
+
+  fp32Accuracy(X, y) {
+    return this._fwd(X).logits.reduce((s,l,i) =>
+      s + (l.indexOf(Math.max(...l))===y[i] ? 1 : 0), 0) / X.length;
+  }
+
+  // Mini-batch SGD with cross-entropy loss
+  train(X, y, epochs, lr, bs) {
+    const n=X.length, rng=seededRng(99);
+    for (let ep=0; ep<epochs; ep++) {
+      const idx = Array.from({length:n}, (_,i)=>i).sort(() => rng()-0.5);
+      for (let s=0; s<n; s+=bs) {
+        const b=idx.slice(s,s+bs), Xb=b.map(i=>X[i]), yb=b.map(i=>y[i]), nb=b.length;
+        const Hp = Xb.map(x => Array.from({length:16}, (_,j)=>{ let a=this.b1[j]; for(let i=0;i<8;i++) a+=x[i]*this.W1[i][j]; return a; }));
+        const H  = Hp.map(h=>h.map(v=>v<0?0:v));
+        const L  = H.map(h  => Array.from({length:4},  (_,j)=>{ let a=this.b2[j]; for(let i=0;i<16;i++) a+=h[i]*this.W2[i][j]; return a; }));
+        const P  = L.map(l  => { const m=Math.max(...l), e=l.map(v=>Math.exp(v-m)), s=e.reduce((a,b)=>a+b,0); return e.map(v=>v/s); });
+        const d2 = P.map((p,i)=>p.map((v,j)=>(v-(j===yb[i]?1:0))/nb));
+        const dW2= Array.from({length:16},(_,i)=>Array.from({length:4}, (_,j)=>d2.reduce((a,d,bi)=>a+H[bi][i]*d[j],0)));
+        const db2= Array.from({length:4}, (_,j)=>d2.reduce((a,d)=>a+d[j],0));
+        const dH = d2.map(d=>Array.from({length:16},(_,i)=>this.W2[i].reduce((a,w,j)=>a+w*d[j],0)));
+        const d1 = dH.map((d,bi)=>d.map((v,i)=>Hp[bi][i]>0?v:0));
+        const dW1= Array.from({length:8}, (_,i)=>Array.from({length:16},(_,j)=>d1.reduce((a,d,bi)=>a+Xb[bi][i]*d[j],0)));
+        const db1= Array.from({length:16},(_,j)=>d1.reduce((a,d)=>a+d[j],0));
+        for(let i=0;i<8;i++)  for(let j=0;j<16;j++) this.W1[i][j]-=lr*dW1[i][j];
+        for(let j=0;j<16;j++) this.b1[j]-=lr*db1[j];
+        for(let i=0;i<16;i++) for(let j=0;j<4;j++)  this.W2[i][j]-=lr*dW2[i][j];
+        for(let j=0;j<4;j++)  this.b2[j]-=lr*db2[j];
+      }
+    }
+  }
+
+  // FPGA quantized inference accuracy  (mirrors fpga_accuracy in neural_net.py)
+  fpgaAcc(X, y, cfg) {
+    const {bit_w} = cfg;
+    const cMax=(1<<(bit_w-1))-1, cMin=-(1<<(bit_w-1));
+    let absX=0; for(const r of X) for(const v of r) if(Math.abs(v)>absX) absX=Math.abs(v);
+    const xSc = absX>0 ? absX/cMax : 1;
+    const Xq  = X.map(r => r.map(v => Math.max(cMin, Math.min(cMax, Math.round(v/xSc)))));
+    let Hq = fpgaLayer(Xq, quantize2d(this.W1,bit_w), quantize1d(this.b1,bit_w), cfg, true);
+    let hAbs=0; for(const r of Hq) for(const v of r) if(Math.abs(v)>hAbs) hAbs=Math.abs(v);
+    if (hAbs>0) { const hSc=hAbs/cMax; Hq=Hq.map(r=>r.map(v=>Math.max(cMin,Math.min(cMax,Math.round(v/hSc))))); }
+    const Lq = fpgaLayer(Hq, quantize2d(this.W2,bit_w), quantize1d(this.b2,bit_w), {...cfg,act_type:0}, false);
+    return Lq.reduce((s,l,i) => s+(l.indexOf(Math.max(...l))===y[i]?1:0), 0) / Lq.length;
+  }
+
+  // QAT fine-tuning with straight-through estimator
+  qatFinetune(X, y, bit_w, epochs, lr) {
+    const cMax=(1<<(bit_w-1))-1, cMin=-(1<<(bit_w-1));
+    const fq = W => { let abs=0; for(const r of W) for(const v of r) if(Math.abs(v)>abs) abs=Math.abs(v); if(!abs) return W; const sc=abs/cMax; return W.map(r=>r.map(v=>Math.max(cMin,Math.min(cMax,Math.round(v/sc)))*sc)); };
+    const rng=seededRng(77), n=X.length;
+    for (let ep=0; ep<epochs; ep++) {
+      const idx=Array.from({length:n},(_,i)=>i).sort(()=>rng()-0.5);
+      for (let s=0; s<n; s+=32) {
+        const b=idx.slice(s,s+32), Xb=b.map(i=>X[i]), yb=b.map(i=>y[i]), nb=b.length;
+        const W1f=fq(this.W1), W2f=fq(this.W2);
+        const Hp=Xb.map(x=>Array.from({length:16},(_,j)=>{ let a=this.b1[j]; for(let i=0;i<8;i++) a+=x[i]*W1f[i][j]; return a; }));
+        const H =Hp.map(h=>h.map(v=>v<0?0:v));
+        const L =H.map(h =>Array.from({length:4}, (_,j)=>{ let a=this.b2[j]; for(let i=0;i<16;i++) a+=h[i]*W2f[i][j]; return a; }));
+        const P =L.map(l =>{ const m=Math.max(...l),e=l.map(v=>Math.exp(v-m)),s=e.reduce((a,b)=>a+b,0); return e.map(v=>v/s); });
+        const d2=P.map((p,i)=>p.map((v,j)=>(v-(j===yb[i]?1:0))/nb));
+        const dW2=Array.from({length:16},(_,i)=>Array.from({length:4}, (_,j)=>d2.reduce((a,d,bi)=>a+H[bi][i]*d[j],0)));
+        const db2=Array.from({length:4}, (_,j)=>d2.reduce((a,d)=>a+d[j],0));
+        const dH =d2.map(d=>Array.from({length:16},(_,i)=>W2f[i].reduce((a,w,j)=>a+w*d[j],0)));
+        const d1 =dH.map((d,bi)=>d.map((v,i)=>Hp[bi][i]>0?v:0));
+        const dW1=Array.from({length:8}, (_,i)=>Array.from({length:16},(_,j)=>d1.reduce((a,d,bi)=>a+Xb[bi][i]*d[j],0)));
+        const db1=Array.from({length:16},(_,j)=>d1.reduce((a,d)=>a+d[j],0));
+        for(let i=0;i<8;i++)  for(let j=0;j<16;j++) this.W1[i][j]-=lr*dW1[i][j];
+        for(let j=0;j<16;j++) this.b1[j]-=lr*db1[j];
+        for(let i=0;i<16;i++) for(let j=0;j<4;j++)  this.W2[i][j]-=lr*dW2[i][j];
+        for(let j=0;j<4;j++)  this.b2[j]-=lr*db2[j];
+      }
+    }
   }
 }
 
-function fp32Ref(w, x, bias, cfg) {
+// ═══════════════════════════════════════════════════════════════════════════
+// HW DOT-PRODUCT PASS RATE  (hard gate: < 0.95 → reward -0.8)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function hwPassRate(cfg) {
   const {bit_w, vec_len, act_type} = cfg;
-  const hi = (1 << (bit_w-1)) - 1, lo = -(1 << (bit_w-1));
-  let acc = bias;
-  for (let i = 0; i < vec_len; i++) acc += w[i] * x[i];
-  if (act_type === 0) acc = acc > hi ? hi : acc < lo ? lo : acc;
-  else if (act_type === 1) acc = acc < 0 ? 0 : acc > hi ? hi : acc;
-  else acc = acc > hi ? hi : acc < lo ? lo : acc;
-  return acc;
-}
-
-function accuracyTest(cfg, nTests = 128) {
-  const {bit_w, vec_len} = cfg;
-  const hi = (1 << (bit_w-1)) - 1, lo = -(1 << (bit_w-1));
-  const sHi = Math.floor(hi/4), sLo = Math.ceil(lo/4);
-  const rng = seededRng(42);
-  const scale = (hi - lo) || 1;
-  let sumErr = 0, passes = 0;
-
-  for (let t = 0; t < nTests; t++) {
-    const w    = Array.from({length: vec_len}, () => randInt(rng, sLo, sHi));
-    const x    = Array.from({length: vec_len}, () => randInt(rng, sLo, sHi));
-    const bias = randInt(rng, sLo, sHi);
-    const ref  = fp32Ref(w, x, bias, cfg);
-    const out  = simDP(w, x, bias, cfg);
-    const err  = Math.abs(out - ref) / scale;
-    sumErr += err;
-    if (err < 0.10) passes++;
+  const hi=(1<<(bit_w-1))-1, lo=-(1<<(bit_w-1));
+  const sHi=Math.floor(hi/4), sLo=Math.ceil(lo/4), scale=(hi-lo)||1;
+  const rng=seededRng(42); let passes=0;
+  for (let t=0; t<64; t++) {
+    const w=Array.from({length:vec_len},()=>sLo+Math.floor(rng()*(sHi-sLo+1)));
+    const x=Array.from({length:vec_len},()=>sLo+Math.floor(rng()*(sHi-sLo+1)));
+    const bias=sLo+Math.floor(rng()*(sHi-sLo+1));
+    let ref=bias; for(let i=0;i<vec_len;i++) ref+=w[i]*x[i];
+    ref = ref<lo?lo : ref>hi?hi : ref;  // clamp reference
+    let out=bias; for(let i=0;i<vec_len;i++) out+=w[i]*x[i];
+    if (act_type===1) out=out<0?0:out>hi?hi:out;
+    else if (act_type===2) out=out<lo?lo:out>hi?hi:out;
+    else { let r=((out%(1<<bit_w))+(1<<bit_w))%(1<<bit_w); if(r>=(1<<(bit_w-1)))r-=(1<<bit_w); out=r; }
+    if (Math.abs(out-ref)/scale < 0.10) passes++;
   }
-  return { mae: sumErr / nTests, pass_rate: passes / nTests };
+  return passes/64;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -510,40 +639,36 @@ function accuracyTest(cfg, nTests = 128) {
 function synthEst(cfg) {
   const {bit_w, vec_len, pipe_stages, act_type, accum_extra, use_dsp} = cfg;
   const accum_w = bit_w*2 + accum_extra + Math.ceil(Math.log2(Math.max(vec_len,2)));
-
-  const mult_luts = use_dsp ? 3*vec_len : Math.floor(Math.pow(bit_w,1.4)*vec_len);
+  const mult_luts  = use_dsp ? 3*vec_len : Math.floor(Math.pow(bit_w,1.4)*vec_len);
   const adder_luts = Math.ceil(Math.ceil(Math.log2(Math.max(vec_len,2))) * accum_w / 4);
-  const act_luts  = [0, Math.floor(bit_w/2), bit_w][act_type];
+  const act_luts   = [0, Math.floor(bit_w/2), bit_w][act_type];
   const luts = mult_luts + adder_luts + act_luts + 8;
   const ffs  = pipe_stages * bit_w + accum_w;
   const dsps = use_dsp ? vec_len : 0;
-
   const mult_d  = use_dsp ? 2.5 : 0.08 * Math.pow(bit_w, 1.5);
   const adder_d = 0.05 * accum_w;
   const act_d   = [0.0, 0.5, 0.8][act_type];
   const cp      = (mult_d + adder_d + act_d) / pipe_stages + 0.5;
   const frequency = Math.min(500, 1000 / Math.max(cp, 0.1));
   const latency   = pipe_stages + 1;
-
   return {luts, ffs, dsps, frequency, latency, synthesis_ok:true};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// REWARD  (matches reward.py exactly)
+// REWARD  (mirrors reward.py — 40% inference_acc PRIMARY signal)
 // ═══════════════════════════════════════════════════════════════════════════
 
-const NORM = {tput:2000e6, acc:0.001, luts:500, freq:200, lat:3};
-const W    = {tput:.30, acc:.20, res:.25, freq:.15, lat:.10};
+const NORM = {tput:2000e6, luts:500, freq:200, lat:3};
 
 function reward(m) {
-  if (!m.synthesis_ok) return -1.0;
-  if (m.pass_rate < 0.95) return -0.8;
-  const sT = Math.min(m.throughput / NORM.tput, 1);
-  const sA = Math.max(0, Math.min(1, 1 - m.mae / (2*NORM.acc)));
-  const sR = Math.max(0, Math.min(1, 1 - m.luts / (2*NORM.luts)));
-  const sF = Math.min(m.frequency / NORM.freq, 1);
-  const sL = Math.max(0, Math.min(1, 1 - m.latency / (2*NORM.lat)));
-  return W.tput*sT + W.acc*sA + W.res*sR + W.freq*sF + W.lat*sL;
+  if (!m.synthesis_ok)        return -1.0;
+  if (m.hw_pass_rate < 0.95)  return -0.8;
+  const sInf  = Math.max(0, Math.min(m.fpga_acc / Math.max(m.fp32_acc, 1e-6), 1));
+  const sTput = Math.min(m.throughput / NORM.tput, 1);
+  const sRes  = Math.max(0, Math.min(1, 1 - m.luts / (2*NORM.luts)));
+  const sFreq = Math.min(m.frequency / NORM.freq, 1);
+  const sLat  = Math.max(0, Math.min(1, 1 - m.latency / (2*NORM.lat)));
+  return 0.40*sInf + 0.25*sTput + 0.20*sRes + 0.10*sFreq + 0.05*sLat;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -626,19 +751,21 @@ function insights() {
 function runIter() {
   const {cfg, method} = selectConfig();
   const syn  = synthEst(cfg);
-  const acc  = accuracyTest(cfg);
   const tput = syn.frequency * 1e6 * cfg.vec_len;
   const m = {
     synthesis_ok: true,
     luts: syn.luts, ffs: syn.ffs, dsps: syn.dsps,
     frequency: syn.frequency, latency: syn.latency,
     throughput: tput, ops_per_lut: tput/Math.max(syn.luts,1),
-    mae: acc.mae, pass_rate: acc.pass_rate,
+    hw_pass_rate: hwPassRate(cfg),
+    fpga_acc: nn.fpgaAcc(DS.X, DS.y, cfg),
+    fp32_acc: nnFp32Acc,
   };
   const prevBest = A.bestReward;
   const r = reward(m);
   agentUpdate(cfg, r);
-  return {cfg, method, metrics:m, reward:r, isBest: r > prevBest};
+  const doQat = (iterDone % 10 === 9);
+  return {cfg, method, metrics:m, reward:r, isBest: r > prevBest, doQat};
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -817,6 +944,9 @@ function initChart() {
         { label:'Best so far', data:[], borderColor:'#79c0ff',
           borderWidth:1, pointRadius:0, fill:false,
           borderDash:[5,5], tension:0 },
+        { label:'FPGA Acc', data:[], borderColor:'#bc8cff',
+          borderWidth:1.5, pointRadius:0, fill:false, tension:.25,
+          yAxisID:'yAcc' },
       ]
     },
     options: {
@@ -830,6 +960,9 @@ function initChart() {
         y:{ min:-1.05, max:1.05,
             grid:{color:'rgba(48,54,61,.45)'},
             ticks:{color:'#8b949e', font:{size:9}} },
+        yAcc:{ position:'right', min:0, max:1.05, grid:{display:false},
+               ticks:{color:'#bc8cff', font:{size:9},
+                      callback: v => (v*100).toFixed(0)+'%'} },
       }
     }
   });
@@ -842,37 +975,42 @@ function initChart() {
 let iterDone = 0;
 let curVerilog = '';
 
-function ui({cfg, method, metrics:m, reward:r, isBest}) {
+function ui({cfg, method, metrics:m, reward:r, isBest, doQat}) {
   iterDone++;
 
   // Config
-  const cv = [cfg.bit_w, cfg.vec_len, cfg.pipe_stages, ACT[cfg.act_type],
-              cfg.accum_extra, cfg.use_dsp ? 'DSP' : 'LUT'];
-  cv.forEach((v,i) => el('c'+i).textContent = v);
+  [cfg.bit_w, cfg.vec_len, cfg.pipe_stages, ACT[cfg.act_type], cfg.accum_extra, cfg.use_dsp?'DSP':'LUT']
+    .forEach((v,i) => el('c'+i).textContent = v);
 
   // Metrics
   el('m0').textContent = m.luts;
   el('m1').textContent = m.frequency.toFixed(0) + ' MHz';
   el('m2').textContent = (m.throughput/1e6).toFixed(0);
-  el('m3').textContent = m.mae.toFixed(4);
+  const me = el('m3');
+  me.textContent = (m.fpga_acc*100).toFixed(1)+'%';
+  me.className   = 'mv ' + (m.fpga_acc>0.85?'g':m.fpga_acc>0.6?'y':'r');
   const re = el('m4');
   re.textContent = fmt(r);
-  re.className = 'mv ' + rClass(r);
+  re.className   = 'mv ' + rClass(r);
+  el('fp32-acc').textContent  = (m.fp32_acc*100).toFixed(1)+'%';
+  el('acc-ratio').textContent = (m.fpga_acc/Math.max(m.fp32_acc,1e-6)*100).toFixed(0)+'%';
 
   // Chart (cap at 300 pts for performance)
   if (chart.data.labels.length >= 300) {
     chart.data.labels.shift();
     chart.data.datasets[0].data.shift();
     chart.data.datasets[1].data.shift();
+    chart.data.datasets[2].data.shift();
   }
   chart.data.labels.push(iterDone);
   chart.data.datasets[0].data.push(r);
   chart.data.datasets[1].data.push(A.bestReward === -Infinity ? null : A.bestReward);
+  chart.data.datasets[2].data.push(m.fpga_acc);
   chart.update('none');
 
   // Exploration
   const exp = A.explored.size;
-  el('exp-n').textContent  = exp;
+  el('exp-n').textContent   = exp;
   el('exp-bar').style.width = (exp/NTOT*100).toFixed(1)+'%';
   el('eps-live').textContent = A.epsilon.toFixed(3);
   el('iter-n').textContent   = iterDone;
@@ -880,22 +1018,21 @@ function ui({cfg, method, metrics:m, reward:r, isBest}) {
   // Best design
   if (A.bestEntry) {
     const bc = A.bestEntry.config;
-    const bm = A.bestEntry.metrics || m;  // fallback
     el('best-r').textContent   = fmt(A.bestReward);
-    el('best-cfg').textContent = `bit_w=${bc.bit_w} vec=${bc.vec_len} pipe=${bc.pipe_stages} act=${ACT[bc.act_type]} dsp=${bc.use_dsp}`;
+    el('best-cfg').textContent = `bit_w=${bc.bit_w} vec=${bc.vec_len} pipe=${bc.pipe_stages} act=${ACT[bc.act_type]}`;
     if (A.bestEntry.metrics) {
-      const bmet = A.bestEntry.metrics;
+      const bm2 = A.bestEntry.metrics;
       el('best-met').textContent =
-        `LUTs=${bmet.luts} · ${bmet.frequency.toFixed(0)}MHz · ${(bmet.throughput/1e6).toFixed(0)}MOPS`;
+        `LUTs=${bm2.luts} · ${bm2.frequency.toFixed(0)}MHz · FPGA=${(bm2.fpga_acc*100).toFixed(0)}%`;
     }
   }
 
   // Trend
   const h = A.history;
   if (h.length >= 4) {
-    const n1 = Math.min(10, h.length), n2 = Math.min(10, h.length);
+    const n1 = Math.min(10, h.length);
     const f  = h.slice(0,n1).reduce((a,e)=>a+e.reward,0)/n1;
-    const l  = h.slice(-n2).reduce((a,e)=>a+e.reward,0)/n2;
+    const l  = h.slice(-n1).reduce((a,e)=>a+e.reward,0)/n1;
     const ar = l > f ? '↑' : '↓';
     const col = l > f ? 'var(--green)' : 'var(--red)';
     el('trend').innerHTML = `<span style="color:${col}">${ar}</span> ${f.toFixed(3)} → ${l.toFixed(3)}`;
@@ -915,25 +1052,27 @@ function ui({cfg, method, metrics:m, reward:r, isBest}) {
   // AI insights
   const ins = insights();
   if (ins) {
-    const lines = Object.entries(ins).map(([p, pref]) => {
+    el('insights').innerHTML = Object.entries(ins).map(([p, pref]) => {
       const vals = pref.slice(0,3).map(({v,diff})=>`<span style="color:var(--green)">${v}(+${(diff*100).toFixed(0)}%)</span>`).join(' ');
       return `<div style="margin:1px 0"><span style="color:var(--dim)">${p}:</span> ${vals}</div>`;
-    });
-    el('insights').innerHTML = lines.join('');
+    }).join('');
   }
 
   // Log row (prepend = newest on top)
   const tbody = el('log-body');
   const row   = document.createElement('tr');
   if (isBest) row.className = 'best-row';
+  const ratPct = (m.fpga_acc/Math.max(m.fp32_acc,1e-6)*100).toFixed(0)+'%';
   row.innerHTML = `
     <td>${String(iterDone).padStart(3,'0')}${isBest?' ★':''}</td>
     <td class="${method==='explore'?'me':'mx'}">${method}</td>
     <td>${cfg.bit_w}</td><td>${cfg.vec_len}</td><td>${cfg.pipe_stages}</td>
     <td>${ACT[cfg.act_type]}</td><td>${cfg.use_dsp?'DSP':'LUT'}</td>
-    <td>${m.luts}</td><td>${m.ffs}</td><td>${m.frequency.toFixed(0)}</td>
-    <td>${(m.throughput/1e6).toFixed(0)}</td><td>${(m.ops_per_lut/1e3).toFixed(0)}k</td>
-    <td>${m.mae.toFixed(4)}</td><td>${(m.pass_rate*100).toFixed(0)}%</td>
+    <td>${m.luts}</td><td>${m.frequency.toFixed(0)}</td>
+    <td>${(m.throughput/1e6).toFixed(0)}</td>
+    <td>${(m.fp32_acc*100).toFixed(1)}%</td>
+    <td class="${m.fpga_acc>0.8?'rg':m.fpga_acc>0.5?'ry':'rr'}">${(m.fpga_acc*100).toFixed(1)}%</td>
+    <td>${ratPct}</td>
     <td class="${rClass(r)}">${fmt(r)}</td>`;
   tbody.insertBefore(row, tbody.firstChild);
   el('log-n').textContent = iterDone;
@@ -945,11 +1084,20 @@ function ui({cfg, method, metrics:m, reward:r, isBest}) {
     el('vcode').innerHTML = hiVerilog(vcode);
     el('v-label').textContent =
       `bit_w=${cfg.bit_w} vec=${cfg.vec_len} pipe=${cfg.pipe_stages} act=${ACT[cfg.act_type]} dsp=${cfg.use_dsp?'DSP':'LUT'}`;
-    // store metrics for best-met fallback
     if (isBest) A.bestEntry.metrics = m;
   }
 
   el('status-badge').textContent = `iter ${iterDone} · ε=${A.epsilon.toFixed(2)}`;
+
+  // QAT every 10 iterations (deferred to keep UI responsive)
+  if (doQat) {
+    const bestCfg = A.bestEntry ? A.bestEntry.config : cfg;
+    setTimeout(() => {
+      nn.qatFinetune(DS.X, DS.y, bestCfg.bit_w, 15, 0.003);
+      nnFp32Acc = nn.fp32Accuracy(DS.X, DS.y);
+      el('fp32-acc').textContent = (nnFp32Acc*100).toFixed(1)+'% ✦QAT';
+    }, 0);
+  }
 }
 
 function el(id) { return document.getElementById(id); }
@@ -967,6 +1115,7 @@ function toggleRun() {
 }
 
 function startRun() {
+  if (!nn || !DS) { el('status-badge').textContent = 'Still initialising NN…'; return; }
   A.lr           = +el('lr-r').value;
   A.epsilonDecay = +el('decay-r').value;
   runTarget = iterDone + (+el('iters-n').value || 50);
@@ -1000,7 +1149,7 @@ function stopRun() {
 }
 
 function stepOne() {
-  if (running) return;
+  if (running || !nn || !DS) return;
   A.lr           = +el('lr-r').value;
   A.epsilonDecay = +el('decay-r').value;
   ui(runIter());
@@ -1020,12 +1169,15 @@ function resetAgent(resetEps=false) {
   chart.data.labels = [];
   chart.data.datasets[0].data = [];
   chart.data.datasets[1].data = [];
+  chart.data.datasets[2].data = [];
   chart.update();
 
   // Reset metrics cards
   ['m0','m1','m2','m3','m4'].forEach(id=>{
     el(id).textContent='—'; el(id).className='mv';
   });
+  el('fp32-acc').textContent = (nnFp32Acc*100).toFixed(1)+'%';
+  el('acc-ratio').textContent = '—';
   // Reset config cells
   ['c0','c1','c2','c3','c4','c5'].forEach(id => el(id).textContent='—');
   // Reset stats
@@ -1066,16 +1218,30 @@ function downloadV() {
 }
 
 // ── Range → display ───────────────────────────────────────────────────────
-function bindRange(id, dispId, fmt) {
+function bindRange(id, dispId, fn) {
   const r=el(id), d=el(dispId);
-  r.addEventListener('input', ()=>d.textContent=fmt(+r.value));
+  r.addEventListener('input', ()=>d.textContent=fn(+r.value));
 }
 bindRange('lr-r',    'lr-v',    v=>v.toFixed(2));
 bindRange('eps-r',   'eps-v',   v=>v.toFixed(2));
 bindRange('decay-r', 'decay-v', v=>v.toFixed(3));
 
 // ── Init ──────────────────────────────────────────────────────────────────
+// Globals populated after training
+let DS = null, nn = null, nnFp32Acc = 0;
+
 initChart();
+el('status-badge').textContent = 'Training NN…';
+
+// Defer NN init + training so the browser can render the page first
+setTimeout(() => {
+  DS = makeDataset(20, 0);          // 80 samples (20 per class)
+  nn = new TinyMLP(0);
+  nn.train(DS.X, DS.y, 120, 0.025, 32);
+  nnFp32Acc = nn.fp32Accuracy(DS.X, DS.y);
+  el('fp32-acc').textContent = (nnFp32Acc*100).toFixed(1)+'%';
+  el('status-badge').textContent = `Ready · FP32 ${(nnFp32Acc*100).toFixed(0)}%`;
+}, 60);
 </script>
 </body>
 </html>
