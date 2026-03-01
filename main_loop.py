@@ -4,7 +4,7 @@ main_loop.py - AI-FPGA Closed Loop Orchestrator.
 
 THE CLOSED LOOP
 ---------------
-  1. AI agent (Q-learning) selects FPGA hardware parameters
+  1. AI agent (DQN) selects FPGA hardware parameters
   2. Synthesizable Verilog is generated for a dot-product unit
   3. The hardware is evaluated (sim or Yosys):
        - Hardware metrics: LUTs, FFs, frequency, throughput
@@ -334,7 +334,7 @@ def main():
         args.train_epochs, args.quiet
     )
 
-    # ── Phase 2: Q-learning loop ───────────────────────────────────────────────
+    # ── Phase 2: DQN loop ─────────────────────────────────────────────────────
     agent = FPGADesignAgent(lr=args.lr, epsilon=args.epsilon)
 
     best_metrics: dict = {}
